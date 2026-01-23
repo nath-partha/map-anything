@@ -330,8 +330,8 @@ def build_colmap_reconstruction(
             params=cam_params,
             camera_id=frame_idx + 1,
         )
-        reconstruction.add_camera(camera)
-
+        # reconstruction.add_camera(camera)
+        reconstruction.add_camera_with_trivial_rig(camera)
         # Create image with pose
         ext = extrinsics[frame_idx]  # (3, 4)
         cam_from_world = pycolmap.Rigid3d(
@@ -340,10 +340,10 @@ def build_colmap_reconstruction(
         )
 
         image = pycolmap.Image(
-            id=frame_idx + 1,
+            image_id=frame_idx + 1,
             name=image_names[frame_idx],
             camera_id=camera.camera_id,
-            cam_from_world=cam_from_world,
+            # cam_from_world=cam_from_world,
         )
 
         # Build Point2D list and update tracks
@@ -362,14 +362,16 @@ def build_colmap_reconstruction(
         if points2d_list:
             try:
                 image.points2D = pycolmap.ListPoint2D(points2d_list)
-                image.registered = True
+                # image.registered = True
             except Exception as e:
                 print(f"Warning: Failed to set points2D for frame {frame_idx}: {e}")
-                image.registered = False
+                # image.registered = False
         else:
-            image.registered = True  # Still registered, just no observations
+            # image.registered = True  # Still registered, just no observations
+            pass
 
-        reconstruction.add_image(image)
+        # reconstruction.add_image(image)
+        reconstruction.add_image_with_trivial_frame(image, cam_from_world)
 
     # Print summary
     total_observations = sum(len(obs) for obs in observations_per_frame)
