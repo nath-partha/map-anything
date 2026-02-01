@@ -154,6 +154,7 @@ def load_images(
     bayer_format=False,
     resolution_set=518,
     stride=1,
+    return_meta=False,
 ):
     """
     Open and convert all images in a list or folder to proper input format for model
@@ -319,6 +320,7 @@ def load_images(
 
     # Second pass: Resize all images to the same target size
     imgs = []
+    imgs_meta = []
     for path, img, W1, H1 in loaded_images:
         # Resize and crop the image to the target size
         img = crop_resize_if_necessary(img, resolution=target_size)[0]
@@ -337,11 +339,21 @@ def load_images(
                 data_norm_type=[norm_type],
             )
         )
+        imgs_meta.append(
+            dict(
+                img_name=path,
+                orig_shape=np.int32([[H1, W1]]),
+                resized_shape=np.int32([img.size[::-1]]),
+                instance=str(len(imgs_meta)),
+                idx=len(imgs_meta),
+            )
+        )
 
     assert imgs, "No images foud at " + root
     if verbose:
         print(f" (Found {len(imgs)} images)")
-
+    if return_meta:
+        return imgs, imgs_meta
     return imgs
 
 

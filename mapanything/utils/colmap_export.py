@@ -11,6 +11,7 @@ with scene-adaptive voxel downsampling and efficient backprojection for Point2D 
 """
 
 import os
+import cv2
 
 import numpy as np
 import trimesh
@@ -520,4 +521,200 @@ def export_predictions_to_colmap(
 
         print(f"Saved {num_frames} processed images to: {images_dir}")
 
+    return reconstruction
+
+
+def export_predictions_to_colmap_new(
+    outputs: list[dict],
+    processed_views: list[dict],
+    processed_views_meta: list[dict],
+    image_names: list[str],
+    output_dir: str,
+    rescale_to_original: bool = True,
+    voxel_fraction: float = 0.01,
+    voxel_size: float | None = None,
+    save_ply: bool = True,
+    save_images: bool = True,
+    skip_point2d: bool = False,
+) -> "pycolmap.Reconstruction":
+    """
+    Export MapAnything predictions to COLMAP format with optional rescaling to original resolution.
+
+    This function extends export_predictions_to_colmap by allowing the output reconstruction
+    to match the original input image resolution and aspect ratio, reversing the crop/resize
+    preprocessing steps.
+
+    Args:
+        outputs: List of prediction dictionaries from model.infer()
+        processed_views: List of preprocessed view dictionaries
+        processed_views_meta: List of metadata dictionaries (containing 'orig_shape', 'resized_shape')
+        image_names: List of original image file names
+        output_dir: Directory to save COLMAP outputs
+        rescale_to_original: If True, rescale intrinsics, depth, and images to original resolution
+        voxel_fraction: Fraction of IQR-based scene extent for voxel size
+        voxel_size: Explicit voxel size in meters
+        save_ply: Whether to save a PLY file of the point cloud
+        save_images: Whether to save processed images
+        skip_point2d: If True, skip Point2D backprojection
+
+    Returns:
+        pycolmap.Reconstruction object
+    """
+    num_frames = len(outputs)
+    
+    # Verify metadata alignment
+    if len(processed_views_meta) != num_frames:
+        print(f"Warning: Meta length {len(processed_views_meta)} != outputs length {num_frames}")
+
+    # Collect data from outputs
+    all_points = []
+    all_colors = []
+    
+    intrinsics_list = []
+    extrinsics_list = []
+    
+    # Store processed maps for saving later
+    processed_maps = []
+
+    for i in range(num_frames):
+        pred = outputs[i]
+        meta = processed_views_meta[i]
+        
+        # Get raw prediction data
+        # Note: Move to CPU/Numpy only when needed to avoid overhead if skipped
+        pts3d = pred["pts3d"][0].cpu().numpy()  # (H_t, W_t, 3)
+        mask = pred["mask"][0].squeeze(-1).cpu().numpy().astype(bool)  # (H_t, W_t)
+        depth_z = pred["depth_z"][0].squeeze(-1).cpu().numpy()  # (H_t, W_t)
+        img_no_norm = pred["img_no_norm"][0].cpu().numpy()  # (H_t, W_t, 3)
+        
+        if "intrinsics" in pred:
+            intrinsics = pred["intrinsics"][0].cpu().numpy() # (3, 3)
+        else:
+             intrinsics = np.eye(3)
+        
+        # Calculate Rescaling Parameters
+        if rescale_to_original:
+            # meta shapes are often stored as numpy arrays e.g. [[H, W]]
+            orig_h, orig_w = meta["orig_shape"][0] 
+            resized_h, resized_w = meta["resized_shape"][0] # This is H_t, W_t (the crop size)
+            
+            # Re-derive scale and crop used in preprocessing
+            scale_final = max(resized_w / orig_w, resized_h / orig_h)
+            
+            # Intermediate size (before cropping)
+            inter_w = int(np.floor(orig_w * scale_final))
+            inter_h = int(np.floor(orig_h * scale_final))
+            
+            # Crop offsets (centered)
+            left = (inter_w - resized_w) // 2
+            top = (inter_h - resized_h) // 2
+            
+            # 1. Update Intrinsics (Copy to avoid mutating original)
+            intrinsics = intrinsics.copy()
+            # Un-crop: shift principal point
+            intrinsics[0, 2] += left
+            intrinsics[1, 2] += top
+            
+            # Un-scale: divide by scale factor
+            intrinsics /= scale_final
+            intrinsics[2, 2] = 1.0 # Homogeneous coordinates
+            
+            # 2. Rescale Image and Depth
+            # Create Canvas of intermediate size
+            
+            # Image
+            canvas_img = np.zeros((inter_h, inter_w, 3), dtype=img_no_norm.dtype)
+            canvas_img[top:top+resized_h, left:left+resized_w] = img_no_norm
+            
+            # Resize
+            img_final = cv2.resize(canvas_img, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+            
+            # Depth
+            canvas_depth = np.zeros((inter_h, inter_w), dtype=depth_z.dtype)
+            canvas_depth[top:top+resized_h, left:left+resized_w] = depth_z
+            
+            # Resize depth
+            depth_final = cv2.resize(canvas_depth, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+            
+            final_h, final_w = int(orig_h), int(orig_w)
+            
+        else:
+            final_h, final_w = img_no_norm.shape[:2]
+            img_final = img_no_norm
+            depth_final = depth_z
+        
+        # Collect Valid Points
+        valid_depth_mask = depth_z > 0
+        combined_mask = mask & valid_depth_mask
+        
+        colors = (img_no_norm * 255).astype(np.uint8)
+        
+        all_points.append(pts3d[combined_mask])
+        all_colors.append(colors[combined_mask])
+        
+        intrinsics_list.append(intrinsics)
+        
+        cam2world = pred["camera_poses"][0].cpu().numpy()
+        world2cam = closed_form_pose_inverse(cam2world[None])[0]
+        extrinsics_list.append(world2cam[:3, :4])
+        
+        # Store for saving
+        processed_maps.append({"img": img_final, "depth": depth_final})
+        
+    # Stack Params
+    intrinsics_stack = np.stack(intrinsics_list)
+    extrinsics_stack = np.stack(extrinsics_list)
+    
+    if rescale_to_original and len(processed_views_meta) > 0:
+        out_h, out_w = processed_views_meta[0]["orig_shape"][0]
+        out_h, out_w = int(out_h), int(out_w)
+    else:
+        out_h, out_w = outputs[0]["img_no_norm"][0].shape[:2]
+
+    # Concatenate Points
+    all_points_concat = np.concatenate(all_points, axis=0)
+    all_colors_concat = np.concatenate(all_colors, axis=0)
+    
+    print(f"Total points: {len(all_points_concat)}")
+    
+    # Downsample
+    # We use the existing downsampler
+    downsampled_points, downsampled_colors = voxel_downsample_point_cloud(
+        all_points_concat, all_colors_concat, voxel_fraction, voxel_size
+    )
+    
+    # Build Reconstruction
+    reconstruction = build_colmap_reconstruction(
+        points_3d=downsampled_points,
+        points_rgb=downsampled_colors,
+        extrinsics=extrinsics_stack,
+        intrinsics=intrinsics_stack,
+        image_width=out_w,
+        image_height=out_h,
+        image_names=image_names,
+        camera_type="PINHOLE",
+        skip_point2d=skip_point2d
+    )
+    
+    # Save
+    sparse_dir = os.path.join(output_dir, "sparse")
+    os.makedirs(sparse_dir, exist_ok=True)
+    reconstruction.write(sparse_dir)
+    print(f"Saved COLMAP reconstruction to: {sparse_dir}")
+
+    if save_ply:
+        ply_path = os.path.join(sparse_dir, "points.ply")
+        trimesh.PointCloud(downsampled_points, colors=downsampled_colors).export(ply_path)
+
+    if save_images:
+        images_dir = os.path.join(output_dir, "images")
+        os.makedirs(images_dir, exist_ok=True)
+        
+        for i, m in enumerate(processed_maps):
+            img = (m["img"] * 255).astype(np.uint8)
+            Image.fromarray(img).save(os.path.join(images_dir, image_names[i]), quality=95)
+            # Could save depth if needed here
+            
+        print(f"Saved {num_frames} processed images to: {images_dir}")
+        
     return reconstruction
