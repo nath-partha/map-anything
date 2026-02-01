@@ -362,7 +362,7 @@ def build_colmap_reconstruction(
         # Set points2D on image
         if points2d_list:
             try:
-                image.points2D = pycolmap.ListPoint2D(points2d_list)
+                image.points2D = pycolmap.Point2DList(points2d_list)
                 # image.registered = True
             except Exception as e:
                 print(f"Warning: Failed to set points2D for frame {frame_idx}: {e}")
