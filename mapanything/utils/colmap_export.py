@@ -708,13 +708,23 @@ def export_predictions_to_colmap_new(
 
     if save_images:
         images_dir = os.path.join(output_dir, "images")
+        depth_dir = os.path.join(output_dir, "depth_maps")
         os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(depth_dir, exist_ok=True)
         
         for i, m in enumerate(processed_maps):
+            name = image_names[i]
+            # Save RGB
             img = (m["img"] * 255).astype(np.uint8)
-            Image.fromarray(img).save(os.path.join(images_dir, image_names[i]), quality=95)
-            # Could save depth if needed here
+            Image.fromarray(img).save(os.path.join(images_dir, name), quality=95)
+            
+            # Save Depth (16-bit PNG in mm, assuming input is meters)
+            depth_mm = (m["depth"] * 1000).astype(np.uint16)
+            # Use original name but replace extension with .png for consistent depth format
+            depth_name = os.path.splitext(name)[0] + ".png"
+            cv2.imwrite(os.path.join(depth_dir, depth_name), depth_mm)
             
         print(f"Saved {num_frames} processed images to: {images_dir}")
+        print(f"Saved {num_frames} depth maps to: {depth_dir}")
         
     return reconstruction
